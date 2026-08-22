@@ -1,0 +1,22 @@
+# PyInstaller and builds
+build/
+dist/*.exe
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Temporary files
+*.dxf
+temp_*.dxf
+temp_check.dxf
+temp_types.dxf
+temp_lwp.dxf
+temp_diag.dxf
+temp_lines_temp.dxf
+diag_lwp_temp.dxf
+diag_lines_temp.dxf
+perf_test_temp.dxf
