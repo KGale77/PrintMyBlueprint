@@ -1,7 +1,6 @@
 # PyInstaller and builds
 build/
 dist/
-*.exe
 *.spec
 
 # Python cache
