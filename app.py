@@ -431,9 +431,9 @@ class App(ctk.CTk):
             except Exception:
                 pass
                 
-        # Crear un nombre temporal único usando PID y timestamp
+        # Crear un nombre temporal único y seguro (solo ASCII) usando PID y timestamp
         temp_dir = tempfile.gettempdir()
-        self.temp_dxf_path = os.path.join(temp_dir, os.path.splitext(os.path.basename(file_path))[0] + f"_pre_{os.getpid()}_{int(time.time())}.dxf")
+        self.temp_dxf_path = os.path.join(temp_dir, f"temp_blueprint_pre_{os.getpid()}_{int(time.time())}.dxf")
         
         # Desactivar botones durante el análisis
         self.btn_select_file.configure(state="disabled")

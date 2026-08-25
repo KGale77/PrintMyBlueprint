@@ -61,6 +61,41 @@ def get_resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+def get_short_path_name(long_name):
+    """
+    Obtiene la versión corta (8.3 format) de una ruta en Windows.
+    Esto es crucial para evitar errores con caracteres no-ASCII (tildes, eñes, etc.)
+    en herramientas de consola compiladas bajo entornos POSIX como LibreDWG.
+    """
+    if not long_name or sys.platform != "win32":
+        return long_name
+    try:
+        import ctypes
+        from ctypes import wintypes
+        
+        # Cargar kernel32
+        _GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        _GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        _GetShortPathNameW.restype = wintypes.DWORD
+        
+        # Primero calcular el tamaño necesario del búfer
+        buf_size = _GetShortPathNameW(long_name, None, 0)
+        if buf_size == 0:
+            # Si el archivo o directorio no existe aún, intentamos resolver
+            # su directorio padre y concatenar el nombre del archivo
+            parent, child = os.path.split(long_name)
+            if parent:
+                parent_short = get_short_path_name(parent)
+                return os.path.join(parent_short, child)
+            return long_name
+            
+        buf = ctypes.create_unicode_buffer(buf_size)
+        _GetShortPathNameW(long_name, buf, buf_size)
+        return buf.value
+    except Exception as e:
+        print(f"Error al obtener short path name para {long_name}: {e}")
+        return long_name
+
 def convert_dwg_to_dxf(dwg_path, dxf_path):
     """
     Convierte un archivo DWG a DXF usando el ejecutable dwg2dxf de LibreDWG.
@@ -72,7 +107,12 @@ def convert_dwg_to_dxf(dwg_path, dxf_path):
         if not os.path.exists(dwg2dxf_exe):
             raise FileNotFoundError(f"No se encontró el convertidor LibreDWG en {dwg2dxf_exe}")
             
-    cmd = [dwg2dxf_exe, "-y", "-o", dxf_path, dwg_path]
+    # Convertir rutas a formato corto (8.3) para evitar problemas con espacios y caracteres especiales/no-ASCII
+    dwg2dxf_exe_short = get_short_path_name(dwg2dxf_exe)
+    dxf_path_short = get_short_path_name(dxf_path)
+    dwg_path_short = get_short_path_name(dwg_path)
+    
+    cmd = [dwg2dxf_exe_short, "-y", "-o", dxf_path_short, dwg_path_short]
     print(f"Ejecutando: {' '.join(cmd)}")
     
     # Ocultar ventana de consola en Windows al ejecutar el proceso
@@ -82,12 +122,19 @@ def convert_dwg_to_dxf(dwg_path, dxf_path):
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
         
+    # Configurar variables de entorno agregando la carpeta de LibreDWG al PATH para la resolución de sus DLLs
+    env = os.environ.copy()
+    exe_dir = os.path.dirname(dwg2dxf_exe)
+    if exe_dir:
+        env["PATH"] = os.path.abspath(exe_dir) + os.pathsep + env.get("PATH", "")
+        
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         startupinfo=startupinfo,
+        env=env,
         check=False
     )
     
@@ -454,9 +501,9 @@ def process_file_to_pdf(dwg_path, output_pdf_path, config, progress_callback=Non
     - combine_pdf: (bool) si se combinan en un solo PDF o se guardan por separado
     - orientation: "auto", "landscape" o "portrait"
     """
-    # Crear un archivo temporal para el DXF
+    # Crear un archivo temporal con nombre seguro en formato ASCII
     temp_dir = tempfile.gettempdir()
-    dxf_name = os.path.splitext(os.path.basename(dwg_path))[0] + "_temp.dxf"
+    dxf_name = f"temp_blueprint_process_{os.getpid()}_{int(time.time())}.dxf"
     temp_dxf_path = os.path.join(temp_dir, dxf_name)
     
     try:
