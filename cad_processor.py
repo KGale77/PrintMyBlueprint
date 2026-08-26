@@ -3,6 +3,7 @@ import sys
 import tempfile
 import subprocess
 import math
+import time
 import ezdxf
 from ezdxf import bbox, recover
 from ezdxf.addons.drawing import Frontend, RenderContext, layout
@@ -49,6 +50,57 @@ def is_valid_bbox(box):
         return True
     except Exception:
         return False
+
+def get_entity_bbox(entity, doc, cache=None):
+    """
+    Calcula de forma segura el bounding box de una entidad.
+    Si es un bloque (INSERT) y falla el método por defecto (común con imágenes o wipeouts
+    corruptos), recorre sus entidades locales de forma segura, calcula sus cajas y aplica
+    la matriz de transformación del bloque.
+    """
+    try:
+        box = bbox.extents([entity], cache=cache)
+        if is_valid_bbox(box):
+            return box
+    except Exception:
+        pass
+        
+    if entity.dxftype() == 'INSERT':
+        try:
+            from ezdxf.math import Vec3, Vec2
+            block = doc.blocks[entity.dxf.name]
+            boxes = []
+            for sub_entity in block:
+                try:
+                    sub_box = bbox.extents([sub_entity], cache=cache)
+                    if is_valid_bbox(sub_box):
+                        boxes.append(sub_box)
+                except Exception:
+                    pass
+            if boxes:
+                m = entity.matrix44()
+                x_mins = [b.extmin.x for b in boxes]
+                y_mins = [b.extmin.y for b in boxes]
+                x_maxs = [b.extmax.x for b in boxes]
+                y_maxs = [b.extmax.y for b in boxes]
+                
+                local_min = Vec3(min(x_mins), min(y_mins), 0)
+                local_max = Vec3(max(x_maxs), max(y_maxs), 0)
+                
+                # Transformar las esquinas del rectángulo local usando la matriz del bloque
+                p1 = m.transform(local_min)
+                p2 = m.transform(local_max)
+                p3 = m.transform(Vec3(local_min.x, local_max.y, 0))
+                p4 = m.transform(Vec3(local_max.x, local_min.y, 0))
+                
+                xs = [p.x for p in (p1, p2, p3, p4)]
+                ys = [p.y for p in (p1, p2, p3, p4)]
+                
+                return BoundingBox2d([Vec2(min(xs), min(ys)), Vec2(max(xs), max(ys))])
+        except Exception:
+            pass
+            
+    return None
 
 def get_resource_path(relative_path):
     """
@@ -151,7 +203,7 @@ def pre_analyze_dxf(dxf_path):
     Analiza de forma rápida el archivo DXF para extraer:
     1. Lista de presentaciones (Layouts/Paper Space).
     2. Lista de nombres de bloques (INSERT) y su frecuencia en el espacio modelo.
-    3. Capas (Layers) disponibles en el espacio modelo.
+    3. Capas (Layers) disponibles en el espacio modelo que tienen geometrías/líneas.
     """
     doc = safe_read_dxf(dxf_path)
     msp = doc.modelspace()
@@ -168,11 +220,10 @@ def pre_analyze_dxf(dxf_path):
         
     blocks = sorted(list(block_counts.items()), key=lambda x: -x[1])
     
-    # 3. Capas de polilíneas cerradas (candidatas a rótulos)
+    # 3. Capas de polilíneas y líneas (candidatas a contener contornos de planos)
     layers = set()
-    for entity in msp.query('LWPOLYLINE POLYLINE'):
-        if entity.is_closed:
-            layers.add(entity.dxf.layer)
+    for entity in msp.query('LWPOLYLINE POLYLINE LINE'):
+        layers.add(entity.dxf.layer)
             
     return {
         "layouts": layouts,
@@ -228,6 +279,7 @@ def is_geometrically_closed(entity):
     """
     Verifica si una polilínea es cerrada geométricamente,
     incluso si su bandera is_closed es False en AutoCAD.
+    Usa una tolerancia dinámica basada en las unidades del dibujo (5 mm).
     """
     if entity.is_closed:
         return True
@@ -236,8 +288,29 @@ def is_geometrically_closed(entity):
         if len(points) >= 3:
             p1 = points[0]
             p2 = points[-1]
-            # Tolerancia de distancia para cerrar el contorno
-            return math.hypot(p1[0] - p2[0], p1[1] - p2[1]) < 2.0
+            
+            # Obtener tolerancia basada en las unidades del dibujo
+            try:
+                doc = entity.doc
+                insunits = doc.units
+            except Exception:
+                insunits = 4  # mm por defecto
+                
+            units_to_mm = {
+                1: 25.4,     # Inches
+                2: 304.8,    # Feet
+                3: 1609344.0,# Miles
+                4: 1.0,      # Millimeters
+                5: 10.0,     # Centimeters
+                6: 1000.0,   # Meters
+                7: 1000000.0,# Kilometers
+                10: 914.4,   # Yards
+            }
+            scale_to_mm = units_to_mm.get(insunits, 1.0)
+            
+            # Tolerancia de 20 mm convertida a unidades del dibujo
+            tolerance = 20.0 / scale_to_mm
+            return math.hypot(p1[0] - p2[0], p1[1] - p2[1]) < tolerance
     return False
 
 def filter_nested_boxes(boxes):
@@ -257,20 +330,23 @@ def filter_nested_boxes(boxes):
     
     for box in sorted_boxes:
         is_nested = False
-        for kept in unique_boxes:
-            w_kept = kept.extmax.x - kept.extmin.x
-            h_kept = kept.extmax.y - kept.extmin.y
-            # Tolerancia del 8% del tamaño del plano exterior
-            tol_x = w_kept * 0.08
-            tol_y = h_kept * 0.08
+        area_box = (box.extmax.x - box.extmin.x) * (box.extmax.y - box.extmin.y)
+        if area_box <= 0:
+            continue
             
-            # Verificar si box está contenido dentro de kept
-            if (kept.extmin.x - tol_x <= box.extmin.x <= kept.extmax.x + tol_x) and \
-               (kept.extmin.y - tol_y <= box.extmin.y <= kept.extmax.y + tol_y) and \
-               (kept.extmin.x - tol_x <= box.extmax.x <= kept.extmax.x + tol_x) and \
-               (kept.extmin.y - tol_y <= box.extmax.y <= kept.extmax.y + tol_y):
-                is_nested = True
-                break
+        for kept in unique_boxes:
+            # Calcular el área de intersección entre box y kept
+            x_min = max(kept.extmin.x, box.extmin.x)
+            y_min = max(kept.extmin.y, box.extmin.y)
+            x_max = min(kept.extmax.x, box.extmax.x)
+            y_max = min(kept.extmax.y, box.extmax.y)
+            
+            if x_min < x_max and y_min < y_max:
+                inter_area = (x_max - x_min) * (y_max - y_min)
+                # Si más del 70% del área de box está contenida dentro de kept, se considera anidado/interno
+                if inter_area > 0.7 * area_box:
+                    is_nested = True
+                    break
         if not is_nested:
             unique_boxes.append(box)
             
@@ -280,38 +356,99 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
     """
     Intenta reconstruir rectángulos cerrados y alineados a los ejes a partir
     de entidades LINE individuales de manera ultra rápida (O(H^2 log V)).
-    Usa una longitud de línea mínima calculada dinámicamente según la escala del espacio modelo.
+    Usa una longitud de línea mínima calculada dinámicamente según la escala del dibujo.
     """
     from ezdxf.math import BoundingBox2d, Vec2
     import math
     import bisect
     
-    lines = list(msp.query('LINE'))
-    if len(lines) < 4:
+    # Extraer todos los segmentos de línea de LINE, LWPOLYLINE y POLYLINE
+    all_segments = []
+    
+    # 1. Entidades LINE
+    for line in msp.query('LINE'):
+        try:
+            all_segments.append((line.dxf.start, line.dxf.end, line.dxf.layer))
+        except Exception:
+            pass
+            
+    # 2. Entidades LWPOLYLINE y POLYLINE
+    for poly in msp.query('LWPOLYLINE POLYLINE'):
+        try:
+            points = get_polyline_points(poly)
+            if len(points) >= 2:
+                is_closed = poly.is_closed or is_geometrically_closed(poly)
+                from ezdxf.math import Vec3
+                for i in range(len(points) - 1):
+                    p1 = Vec3(points[i][0], points[i][1], 0)
+                    p2 = Vec3(points[i+1][0], points[i+1][1], 0)
+                    all_segments.append((p1, p2, poly.dxf.layer))
+                if is_closed:
+                    p1 = Vec3(points[-1][0], points[-1][1], 0)
+                    p2 = Vec3(points[0][0], points[0][1], 0)
+                    all_segments.append((p1, p2, poly.dxf.layer))
+        except Exception:
+            pass
+
+    if len(all_segments) < 4:
         return []
         
-    # Calcular extensión general del Espacio Modelo para definir un umbral de longitud dinámico
+    doc = msp.doc
+    try:
+        insunits = doc.units
+    except Exception:
+        insunits = 4  # mm por defecto
+        
+    # Calcular extensión general del Espacio Modelo
     try:
         msp_box = bbox.extents(msp, cache=cache)
         if msp_box.has_data:
             w_msp = msp_box.extmax.x - msp_box.extmin.x
             h_msp = msp_box.extmax.y - msp_box.extmin.y
             max_dim = max(w_msp, h_msp)
-            # El borde de una hoja debe medir al menos el 1.5% del tamaño total del dibujo,
-            # con un tope máximo conservador de 10.0 unidades (para planos en mm/cm).
-            min_line_length = max(0.05, min(10.0, max_dim * 0.015))
         else:
-            min_line_length = 10.0
+            max_dim = 1000.0
     except Exception:
-        min_line_length = 10.0
+        max_dim = 1000.0
+
+    # Heurística: Si las unidades no están especificadas (0) pero las dimensiones
+    # generales son pequeñas, asumimos metros (6). De lo contrario, mm (4).
+    if insunits == 0:
+        if max_dim < 300.0:
+            insunits = 6
+        else:
+            insunits = 4
+            
+    # Obtener el factor de conversión: 1 unidad del dibujo = X milímetros
+    units_to_mm = {
+        1: 25.4,     # Inches
+        2: 304.8,    # Feet
+        3: 1609344.0,# Miles
+        4: 1.0,      # Millimeters
+        5: 10.0,     # Centimeters
+        6: 1000.0,   # Meters
+        7: 1000000.0,# Kilometers
+        10: 914.4,   # Yards
+    }
+    scale_to_mm = units_to_mm.get(insunits, 1.0)
+    
+    # El borde de una hoja debe medir al menos 100 mm. Convertimos a unidades locales.
+    min_line_length = 100.0 / scale_to_mm
+    
+    # Pero no debe ser mayor que el 15% del tamaño total para dibujos muy pequeños, ni menor que 0.05 unidades locales.
+    min_line_length = min(min_line_length, max_dim * 0.15)
+    min_line_length = max(0.05, min_line_length)
         
     v_lines = []
     h_lines = []
-    tol = 0.5  # Tolerancia angular para líneas verticales/horizontales
     
-    for line in lines:
-        p1 = line.dxf.start
-        p2 = line.dxf.end
+    # Tolerancia angular para líneas verticales/horizontales (en unidades del dibujo)
+    # 0.5 unidades de dibujo es bastante permisivo para rotaciones leves.
+    tol = 0.5 
+    
+    for start_pt, end_pt, layer in all_segments:
+        p1 = start_pt
+        p2 = end_pt
         
         dx = abs(p1.x - p2.x)
         dy = abs(p1.y - p2.y)
@@ -329,7 +466,7 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
                 "y_min": y_min,
                 "y_max": y_max,
                 "length": y_max - y_min,
-                "layer": line.dxf.layer
+                "layer": layer
             })
         elif dy < tol:  # Horizontal
             x_min = min(p1.x, p2.x)
@@ -339,7 +476,7 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
                 "x_min": x_min,
                 "x_max": x_max,
                 "length": x_max - x_min,
-                "layer": line.dxf.layer
+                "layer": layer
             })
             
     # Indexar líneas verticales por X para búsquedas binarias ultrarrápidas
@@ -359,6 +496,9 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
         return False
 
     rect_candidates = []
+    
+    # Mínimo absoluto de tolerancia física (10 mm) en unidades del dibujo
+    min_tol = 10.0 / scale_to_mm
     
     # Emparejar líneas horizontales (tienen que compartir X similar y estar en Y distintos)
     h_count = len(h_lines)
@@ -382,8 +522,9 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
             if width_avg < min_size[0]:
                 continue
                 
-            length_tol = max(5.0, width_avg * 0.015)
-            align_tol = max(5.0, width_avg * 0.015)
+            # Usar tolerancia del 5% del ancho, pero no menor que el mínimo absoluto
+            length_tol = max(min_tol, width_avg * 0.05)
+            align_tol = max(min_tol, width_avg * 0.05)
             
             if abs(h_bottom["length"] - h_top["length"]) > length_tol:
                 continue
@@ -397,8 +538,8 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
             y_max = h_top["y"]
             
             # Buscar si existen las dos líneas verticales que cierran el rectángulo
-            h_len_tol = max(5.0, height * 0.015)
-            h_align_tol = max(5.0, height * 0.015)
+            h_len_tol = max(min_tol, height * 0.05)
+            h_align_tol = max(min_tol, height * 0.05)
             
             if has_vertical_connection(x_min, y_min, y_max, height, h_align_tol, h_len_tol) and \
                has_vertical_connection(x_max, y_min, y_max, height, h_align_tol, h_len_tol):
@@ -416,13 +557,55 @@ def detect_sheets_in_modelspace(dxf_path, method="auto", block_name=None, layer_
     msp = doc.modelspace()
     cache = bbox.Cache()
     
+    # Determinar unidades del documento para ajustar el tamaño mínimo por defecto
+    try:
+        insunits = doc.units
+    except Exception:
+        insunits = 4  # mm por defecto
+        
+    # Obtener el factor de conversión: 1 unidad del dibujo = X milímetros
+    units_to_mm = {
+        1: 25.4,     # Inches
+        2: 304.8,    # Feet
+        3: 1609344.0,# Miles
+        4: 1.0,      # Millimeters
+        5: 10.0,     # Centimeters
+        6: 1000.0,   # Meters
+        7: 1000000.0,# Kilometers
+        10: 914.4,   # Yards
+    }
+    scale_to_mm = units_to_mm.get(insunits, 1.0)
+    
+    # Si las unidades son 0 (unspecified), estimar en base a las dimensiones generales
+    if insunits == 0:
+        try:
+            msp_box = bbox.extents(msp, cache=cache)
+            if msp_box.has_data:
+                max_dim = max(msp_box.extmax.x - msp_box.extmin.x, msp_box.extmax.y - msp_box.extmin.y)
+            else:
+                max_dim = 1000.0
+        except Exception:
+            max_dim = 1000.0
+            
+        if max_dim < 300.0:
+            scale_to_mm = 1000.0  # Asumir metros
+        else:
+            scale_to_mm = 1.0     # Asumir milímetros
+            
+    # El tamaño mínimo de una hoja debe ser de al menos 150mm x 150mm en unidades del dibujo
+    min_size_units = (150.0 / scale_to_mm, 150.0 / scale_to_mm)
+    
+    # Si min_size es el valor por defecto extremadamente pequeño, lo actualizamos al dinámico
+    if min_size == (0.05, 0.05):
+        min_size = min_size_units
+        
     candidates = []
     
     if method == "block" and block_name:
         # Buscar por inserciones de un bloque específico
         for entity in msp.query(f'INSERT[name=="{block_name}"]'):
             try:
-                entity_box = bbox.extents([entity], cache=cache)
+                entity_box = get_entity_bbox(entity, doc, cache=cache)
                 if not is_valid_bbox(entity_box):
                     continue
                 # Validar que tenga dimensiones mínimas válidas
@@ -443,7 +626,7 @@ def detect_sheets_in_modelspace(dxf_path, method="auto", block_name=None, layer_
         for entity in entities:
             if is_geometrically_closed(entity):
                 try:
-                    entity_box = bbox.extents([entity], cache=cache)
+                    entity_box = get_entity_bbox(entity, doc, cache=cache)
                     if not is_valid_bbox(entity_box):
                         continue
                     w = entity_box.extmax.x - entity_box.extmin.x
@@ -459,16 +642,16 @@ def detect_sheets_in_modelspace(dxf_path, method="auto", block_name=None, layer_
         for entity in entities:
             if is_geometrically_closed(entity):
                 try:
-                    entity_box = bbox.extents([entity], cache=cache)
+                    entity_box = get_entity_bbox(entity, doc, cache=cache)
                     if not is_valid_bbox(entity_box):
                         continue
                     w = entity_box.extmax.x - entity_box.extmin.x
                     h = entity_box.extmax.y - entity_box.extmin.y
                     
                     if w >= min_size[0] and h >= min_size[1]:
-                        # Aceptar un rango de aspecto amplio para formatos apaisados, verticales y alargados (1.0 a 3.0)
+                        # Aceptar un rango de aspecto amplio para formatos apaisados, verticales y alargados (1.0 a 6.0)
                         ratio = max(w, h) / min(w, h)
-                        if 1.0 <= ratio <= 3.0:
+                        if 1.0 <= ratio <= 6.0:
                             candidates.append(entity_box)
                 except Exception as e:
                     pass
@@ -479,7 +662,30 @@ def detect_sheets_in_modelspace(dxf_path, method="auto", block_name=None, layer_
             candidates.extend(line_rects)
         except Exception as e:
             print(f"Error al reconstruir rectángulos desde líneas sueltas: {e}")
+            
+        # 3. Buscar inserciones de bloques (INSERT) que puedan ser marcos de planos
+        for entity in msp.query('INSERT'):
+            try:
+                entity_box = get_entity_bbox(entity, doc, cache=cache)
+                if not is_valid_bbox(entity_box):
+                    continue
+                w = entity_box.extmax.x - entity_box.extmin.x
+                h = entity_box.extmax.y - entity_box.extmin.y
+                if w >= min_size[0] and h >= min_size[1]:
+                    ratio = max(w, h) / min(w, h)
+                    # Relación de aspecto entre 1.0 y 6.0 para láminas
+                    if 1.0 <= ratio <= 6.0:
+                        candidates.append(entity_box)
+            except Exception as e:
+                pass
                     
+    # Filtrar por área relativa para conservar solo formatos grandes (láminas)
+    # y descartar detalles, notas o tablas de menor tamaño
+    if candidates:
+        areas = [(b.extmax.x - b.extmin.x) * (b.extmax.y - b.extmin.y) for b in candidates]
+        max_area = max(areas)
+        candidates = [box for box, area in zip(candidates, areas) if area >= 0.8 * max_area]
+
     # Filtrar rectángulos anidados (ej. conservar solo el marco exterior)
     if candidates:
         candidates = filter_nested_boxes(candidates)
